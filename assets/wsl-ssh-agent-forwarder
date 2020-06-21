@@ -1,0 +1,75 @@
+#!/bin/bash
+
+SOCKFILE="${1:-${SSH_AUTH_SOCK}}"
+[ -z "${SOCKFILE}" ] && SOCKFILE="${HOME}/.ssh/wsl-ssh-agent-forwarder.sock"
+SOCKPIDFILE="${SOCKFILE}.pid"
+NPIPE=/path/to/npiperelay.exe
+
+SOCKFILE=$( realpath "${SOCKFILE}" )
+SOCKPIDFILE=$( realpath "${SOCKPIDFILE}" )
+
+#    SOCKFILE  SOCKPIDFILE          Action
+# 1  present   present and valid    do nothing
+# 2  present   missing or invalid   look for orphans, human fix
+# 3  absent    present and valid    kill pid, if killed then start agent else error
+# 4  absent    present and invalid  remove pidfile, start agent
+# 5  absent    absent               start agent
+
+function state_sock() {
+    # 1=missing, 2=present, 3=error
+    [ -e "${SOCKFILE}" ] || { echo "1" ; return; } # missing
+    ss -a | egrep -q " +${SOCKFILE} [0-9]+ +" && { echo "2" ; return; } # present
+    echo "3" # error
+}
+
+function state_pid() {
+    # 5=missing, 6=present, 7=error
+    [ -e "${SOCKPIDFILE}" ] || { echo "5" ; return; } # missing
+    THEPID=$(sed -nE 's/^([0-9]+)[^0-9]*$/\1/gp' "${SOCKPIDFILE}")
+    [ -n "${THEPID}" ] \
+        && ps h "${THEPID}" | grep -q "[U]NIX-LISTEN:${SOCKFILE},fork" \
+        && echo "6" || echo "7"
+}
+
+function start_agent() {
+    trap "rm -f '${SOCKPIDFILE}'" RETURN EXIT SIGTERM SIGHUP
+    socat UNIX-LISTEN:${SOCKFILE},fork EXEC:"${NPIPE} -ei -s //./pipe/openssh-ssh-agent",nofork > /dev/null 2>&1 &
+    CHILDPID=$!
+    echo "${CHILDPID}" > "${SOCKPIDFILE}"
+    wait ${CHILDPID}
+}
+
+SOCKSTATE=$(state_sock "${SOCKFILE}")
+PIDSTATE=$(state_pid "${SOCKPIDFILE}")
+
+case "${SOCKSTATE}${PIDSTATE}" in
+    15) # missing/missing # NORMAL
+        start_agent &
+        ;;
+    16) # missing/good
+        echo "process appears to be running but no sock" > /dev/stderr
+        exit -1
+        ;;
+    17) # missing/bad
+        echo "pidfile is stale/bad, clearing, starting" > /dev/stderr
+        rm -f "${SOCKPIDFILE}"
+        start_agent &
+        ;;
+    25) # present/missing
+        echo "pidfile is missing, agent exists, please fix; following are candidate processes" > /dev/stderr
+        ps hax | grep "[U]NIX-LISTEN:${SOCKFILE},fork" > /dev/stderr
+        exit -1
+        ;;
+    26) # present/present # NORMAL
+        echo "Reusing existing connection" > /dev/stderr
+        exit 0
+        ;;
+    27) # present/error
+        echo "pidfile is wrong, agent exists, please fix" > /dev/stderr
+        exit -1
+        ;;
+    3*) # error/anything
+        echo "problem with the agent, please fix" > /dev/stderr
+        exit -1
+        ;;
+esac
